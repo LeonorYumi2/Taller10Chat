@@ -1,85 +1,90 @@
 import { useAuthStore } from "@features/auth/presentation/store/authStore";
 import { GetMessagesUseCase } from "@features/chat/application/use-cases/GetMessagesUseCase";
+import { SendImageUseCase } from "@features/chat/application/use-cases/SendImageUseCase";
 import { SendMessageUseCase } from "@features/chat/application/use-cases/SendMessageUseCase";
 import { SubscribeToRoomUseCase } from "@features/chat/application/use-cases/SubscribeToRoomUseCase";
+import { ChatImage } from "@features/chat/domain/entities/ChatImage";
 import { Message } from "@features/chat/domain/entities/Message";
 import { SupabaseChatRepository } from "@features/chat/infrastructure/repositories/SupabaseChatRepository";
+import { ChatError } from "@shared/domain/errors/AppError";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useEffect } from "react";
+import { randomUUID } from "expo-crypto";
+import { useEffect, useMemo } from "react";
 
 const chatRepo = new SupabaseChatRepository();
 const sendMessageUseCase = new SendMessageUseCase(chatRepo);
+const sendImageUseCase = new SendImageUseCase(chatRepo);
 const getMessagesUseCase = new GetMessagesUseCase(chatRepo);
 const subscribeUseCase = new SubscribeToRoomUseCase(chatRepo);
+
+function mergeMessage(messages: Message[], message: Message, optimisticId?: string) {
+  return [...messages.filter((item) => item.id !== message.id && item.id !== optimisticId), message]
+    .sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
 
 export function useChat(roomId: string) {
   const user = useAuthStore((s) => s.user);
   const queryClient = useQueryClient();
+  const userId = user?.id;
+  const queryKey = useMemo(() => ["messages", userId, roomId], [userId, roomId]);
 
-  // Paso 1: obtener historial de mensajes con cache
-  const { data: messages = [], isLoading } = useQuery({
-    queryKey: ["messages", roomId], // Clave única por sala
+  const { data: messages = [], isPending, isError, refetch } = useQuery({
+    queryKey,
     queryFn: () => getMessagesUseCase.execute(roomId),
-    enabled: !!user,
-    // Los mensajes antiguos no se revalidan automáticamente.
-    // Realtime se encarga de los mensajes nuevos.
-    staleTime: Infinity,
+    enabled: !!userId && !!roomId,
   });
 
-  // Paso 2: suscribirse al canal Realtime
   useEffect(() => {
-    const unsubscribe = subscribeUseCase.execute(roomId, (newMsg) => {
-      queryClient.setQueryData(["messages", roomId], (old: Message[] = []) => {
-        // Evitar duplicados: el optimistic update ya agregó este mensaje
-        const exists = old.some((m) => m.id === newMsg.id);
-        return exists ? old : [...old, newMsg];
-      });
-    });
-    return unsubscribe; // Cleanup al desmontar: cierra el WebSocket
-  }, [roomId]);
+    if (!userId || !roomId) return;
+    return subscribeUseCase.execute(roomId, (message) => {
+      queryClient.setQueryData(queryKey, (old: Message[] = []) => mergeMessage(old, message));
+    }, () => { void queryClient.invalidateQueries({ queryKey }); });
+  }, [queryClient, queryKey, roomId, userId]);
 
-  // Paso 3: enviar mensaje con optimistic update via useMutation
-  const sendMutation = useMutation({
-    mutationFn: (content: string) =>
-      sendMessageUseCase.execute(roomId, user!.id, content),
-
-    // onMutate se ejecuta ANTES de la petición (optimistic update)
+  const textMutation = useMutation({
+    mutationFn: (content: string) => {
+      if (!userId) throw new ChatError("Inicia sesión para enviar mensajes.");
+      return sendMessageUseCase.execute(roomId, userId, content);
+    },
     onMutate: async (content) => {
-      const tempMsg: Message = {
-        id: `temp-${Date.now()}`,
-        roomId,
-        userId: user!.id,
-        content,
-        createdAt: new Date(),
-        authorUsername: user!.username,
+      if (!userId) return;
+      await queryClient.cancelQueries({ queryKey });
+      const message: Message = {
+        id: `temp-${randomUUID()}`, roomId, userId, content,
+        createdAt: new Date(), authorUsername: user?.username,
       };
-      queryClient.setQueryData(["messages", roomId], (old: Message[] = []) => [
-        ...old,
-        tempMsg,
-      ]);
-      return { tempMsg }; // Contexto para onError
+      queryClient.setQueryData(queryKey, (old: Message[] = []) => mergeMessage(old, message));
+      return message.id;
     },
-
-    onSuccess: (realMsg, _content, context) => {
-      queryClient.setQueryData(["messages", roomId], (old: Message[] = []) =>
-        old.map((m) => (m.id === context?.tempMsg.id ? realMsg : m)),
-      );
+    onSuccess: (message, _content, optimisticId) => {
+      queryClient.setQueryData(queryKey, (old: Message[] = []) => mergeMessage(old, message, optimisticId));
     },
-
-    onError: (_err, _content, context) => {
-      if (context?.tempMsg) {
-        queryClient.setQueryData(["messages", roomId], (old: Message[] = []) =>
-          old.filter((m) => m.id !== context.tempMsg.id),
-        );
-      }
+    onError: (_error, _content, optimisticId) => {
+      queryClient.setQueryData(queryKey, (old: Message[] = []) => old.filter((item) => item.id !== optimisticId));
     },
   });
 
-  return {
-    messages,
-    sendMessage: sendMutation.mutate,
-    isLoading,
-    isSending: sendMutation.isPending,
-  };
+  const imageMutation = useMutation({
+    mutationFn: (image: ChatImage) => {
+      if (!userId) throw new ChatError("Inicia sesión para enviar imágenes.");
+      return sendImageUseCase.execute(roomId, userId, image);
+    },
+    onSuccess: (message) => {
+      queryClient.setQueryData(queryKey, (old: Message[] = []) => mergeMessage(old, message));
+    },
+    gcTime: 0,
+  });
+
+  return { messages, isPending, isError, refetch, textMutation, imageMutation };
 }
 
+export function useChatImageUrl(path: string) {
+  const userId = useAuthStore((s) => s.user?.id);
+  return useQuery({
+    queryKey: ["chat-image-url", userId, path],
+    queryFn: () => chatRepo.getImageUrl(path),
+    enabled: !!userId,
+    staleTime: 240_000,
+    gcTime: 300_000,
+  });
+}

@@ -3,8 +3,8 @@ import { IChatRepository } from "../../domain/repositories/IChatRepository";
 
 export class SubscribeToRoomUseCase {
   constructor(private readonly chatRepo: IChatRepository) {}
-  execute(roomId: string, onMessage: (msg: Message) => void): () => void {
-    return this.chatRepo.subscribeToRoom(roomId, onMessage);
+
+  execute(roomId: string, onMessage: (msg: Message) => void, onSubscribed: () => void) {
+    return this.chatRepo.subscribeToRoom(roomId, onMessage, onSubscribed);
   }
 }
-
